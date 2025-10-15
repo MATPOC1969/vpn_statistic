@@ -213,7 +213,9 @@ def sync_clients(conn, stats_from_remote=None):
     """Синхронизирует локальные VPN-клиенты и новые IP с удалённых серверов."""
     cur = conn.cursor()
     cur.execute("SELECT code, address FROM vpnusers;")
-    existing_addresses = {row["address"]: row["code"] for row in cur.fetchall()}
+    rows = cur.fetchall()
+    existing_addresses = {row["address"] for row in rows}
+    existing_codes = {row["code"] for row in rows}
 
     added = 0
     total = 0
@@ -235,7 +237,7 @@ def sync_clients(conn, stats_from_remote=None):
             continue
 
         address = data.get("address", "").split("/")[0] if data.get("address") else None
-        if address in existing_addresses:
+        if address in existing_addresses or code in existing_codes:
             log(f"✔️  Клиент уже есть: {code}")
             continue
 
@@ -259,7 +261,8 @@ def sync_clients(conn, stats_from_remote=None):
                 allowed_ips, endpoint, dns, persistent_keepalive,
                 soft, provider1, created_at
             )
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW());
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+            ON CONFLICT (code) DO NOTHING;
         """, (
             code, address,
             enc_private, enc_public, enc_preshared,
@@ -267,8 +270,12 @@ def sync_clients(conn, stats_from_remote=None):
             soft, provider
         ))
 
-        added += 1
-        log(f"➕ Добавлен новый клиент: {code} ({address}) — {soft}/{provider}")
+        if cur.rowcount > 0:
+            added += 1
+            existing_codes.add(code)
+            if address:
+                existing_addresses.add(address)
+            log(f"➕ Добавлен новый клиент: {code} ({address}) — {soft}/{provider}")
 
     # --- 2. Добавляем новые IP, найденные на удалённых серверах ---
     if stats_from_remote:
@@ -286,10 +293,14 @@ def sync_clients(conn, stats_from_remote=None):
             soft, provider = detect_soft_provider("wg0", s["endpoint"])
             cur.execute("""
                 INSERT INTO vpnusers (code, address, soft, provider1, created_at)
-                VALUES (%s, %s, %s, %s, NOW());
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (code) DO NOTHING;
             """, (code_auto, ip, soft, provider))
-            added += 1
-            log(f"➕ Добавлен новый клиент (из {s['provider']}): {ip}")
+            if cur.rowcount > 0:
+                added += 1
+                existing_codes.add(code_auto)
+                existing_addresses.add(ip)
+                log(f"➕ Добавлен новый клиент (из {s['provider']}): {ip}")
     
     conn.commit()
     cur.close()
