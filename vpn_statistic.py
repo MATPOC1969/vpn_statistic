@@ -203,13 +203,41 @@ def read_remote_conf(file_path: str, host: str, port: int = 22) -> dict:
         ]
         fields = {}
         for key_name in keys:
-            match = re.search(rf"{key_name}\s*=\s*(\S+)", content)
+            # Берем все до конца строки, убирая пробелы в начале и конце
+            match = re.search(rf"{key_name}\s*=\s*(.+?)$", content, re.MULTILINE)
             if match:
-                fields[key_name.lower()] = match.group(1)
+                fields[key_name.lower()] = match.group(1).strip()
         return fields
     except Exception as e:
         log(f"⚠️  Ошибка чтения удаленного файла {file_path}: {e}")
         return {}
+
+
+def get_file_creation_time(file_path, host: str = "localhost", port: int = 22):
+    """Получает дату создания файла (локально или удаленно)"""
+    try:
+        if host in ("localhost", "127.0.0.1"):
+            # Локальный файл
+            if isinstance(file_path, str):
+                file_path = Path(file_path)
+            stat = file_path.stat()
+            # Используем mtime (время модификации), так как в Linux нет надежного ctime
+            return datetime.fromtimestamp(stat.st_mtime, UTC)
+        else:
+            # Удаленный файл - получаем timestamp через SSH
+            cmd = [
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-p", str(port),
+                f"root@{host}",
+                f"stat -c %Y {file_path}"
+            ]
+            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
+            timestamp = int(output)
+            return datetime.fromtimestamp(timestamp, UTC)
+    except Exception as e:
+        log(f"⚠️  Не удалось получить дату создания {file_path}: {e}")
+        return None
 
 
 def db_connect():
@@ -240,9 +268,10 @@ def parse_conf(file_path: Path) -> dict:
     ]
     fields = {}
     for key_name in keys:
-        match = re.search(rf"{key_name}\s*=\s*(\S+)", content)
+        # Берем все до конца строки, убирая пробелы в начале и конце
+        match = re.search(rf"{key_name}\s*=\s*(.+?)$", content, re.MULTILINE)
         if match:
-            fields[key_name.lower()] = match.group(1)
+            fields[key_name.lower()] = match.group(1).strip()
     return fields
 
 
@@ -306,11 +335,12 @@ def parse_wg_output(output, interface: str):
     for i, line in enumerate(output):
         parts = line.split("\t")
         if i == 0 and len(parts) == 4:
+            # Это заголовок интерфейса, пропускаем
             continue
         if len(parts) < 8:
             continue
 
-        public_key, preshared_key, endpoint, allowed_ips, last_hs, rx, tx, keepalive = parts
+        public_key, preshared_key, endpoint_client, allowed_ips, last_hs, rx, tx, keepalive = parts
         last_seen = parse_handshake(last_hs)
         try:
             rx, tx = int(rx), int(tx)
@@ -322,7 +352,8 @@ def parse_wg_output(output, interface: str):
             "last_seen": last_seen,
             "rx": rx,
             "tx": tx,
-            "interface": interface
+            "interface": interface,
+            "endpoint_client": endpoint_client if endpoint_client != "(none)" else None
         }
     return stats
 
@@ -426,11 +457,17 @@ def sync_clients(conn):
                 enc_preshared = fernet.encrypt(data["presharedkey"].encode()).decode() if data.get("presharedkey") else None
                 
                 # Получаем остальные поля
-                address = data.get("address", "").split("/")[0] if data.get("address") else None
+                address = data.get("address")
                 allowed_ips = data.get("allowedips")
                 endpoint = data.get("endpoint")
                 dns = data.get("dns")
                 keepalive = data.get("persistentkeepalive")
+                
+                # Получаем дату создания файла
+                if conf_info["is_local"]:
+                    file_created_at = get_file_creation_time(conf_info["path"])
+                else:
+                    file_created_at = get_file_creation_time(conf_info["path"], conf_info["host"], conf_info["port"])
                 
                 # Вставляем клиента в БД
                 cur.execute("""
@@ -440,13 +477,13 @@ def sync_clients(conn):
                         allowed_ips, endpoint, dns, persistent_keepalive,
                         soft, provider1, interface, created_at
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (code) DO NOTHING;
                 """, (
                     code, address,
                     enc_private, enc_public, enc_preshared,
                     allowed_ips, endpoint, dns, keepalive,
-                    soft, provider, interface
+                    soft, provider, interface, file_created_at
                 ))
                 
                 if cur.rowcount > 0:
@@ -464,39 +501,49 @@ def update_stats(conn, stats):
     updated = 0
     not_found = 0
     
+    # Получаем всех клиентов с их зашифрованными публичными ключами
+    cur.execute("SELECT code, public_key, interface, provider1 FROM vpnusers WHERE public_key IS NOT NULL;")
+    clients = cur.fetchall()
+    
+    # Создаем словарь расшифрованных ключей для быстрого поиска
+    decrypted_keys = {}
+    for client in clients:
+        try:
+            encrypted_key = client["public_key"]
+            if encrypted_key:
+                decrypted_key = fernet.decrypt(encrypted_key.encode()).decode()
+                # Ключ: (provider, interface, decrypted_public_key)
+                key = (client["provider1"], client["interface"], decrypted_key)
+                decrypted_keys[key] = client["code"]
+        except Exception as e:
+            log(f"⚠️  Ошибка расшифровки ключа для {client['code']}: {e}")
+            continue
+    
+    log(f"🔑 Расшифровано {len(decrypted_keys)} публичных ключей")
+    
+    # Обновляем статистику
     for key, s in stats.items():
         provider, interface, public_key = key
         
-        # Расшифровываем публичный ключ из БД и ищем соответствующего клиента
-        cur.execute("SELECT code, public_key FROM vpnusers WHERE interface = %s AND provider1 = %s;", 
-                    (interface, provider))
-        
-        found = False
-        for row in cur.fetchall():
-            try:
-                # Расшифровываем публичный ключ из БД
-                encrypted_key = row["public_key"]
-                if encrypted_key:
-                    decrypted_key = fernet.decrypt(encrypted_key.encode()).decode()
-                    if decrypted_key == public_key:
-                        # Обновляем статистику
-                        cur.execute("""
-                            UPDATE vpnusers
-                               SET last_seen = %s,
-                                   transfer_rx = %s,
-                                   transfer_tx = %s
-                             WHERE code = %s;
-                        """, (s["last_seen"], s["rx"], s["tx"], row["code"]))
-                        if cur.rowcount > 0:
-                            updated += 1
-                            found = True
-                            break
-            except Exception as e:
-                # Игнорируем ошибки расшифровки
-                continue
-        
-        if not found:
+        # Ищем клиента по ключу
+        lookup_key = (provider, interface, public_key)
+        if lookup_key in decrypted_keys:
+            code = decrypted_keys[lookup_key]
+            # Обновляем статистику
+            cur.execute("""
+                UPDATE vpnusers
+                   SET last_seen = %s,
+                       transfer_rx = %s,
+                       transfer_tx = %s,
+                       endpoint_client = %s
+                 WHERE code = %s;
+            """, (s["last_seen"], s["rx"], s["tx"], s.get("endpoint_client"), code))
+            if cur.rowcount > 0:
+                updated += 1
+        else:
             not_found += 1
+            # Для отладки
+            log(f"⚠️  Не найден клиент для ключа: {public_key[:20]}... на {provider}/{interface}")
     
     conn.commit()
     cur.close()
