@@ -611,8 +611,7 @@ def update_stats(conn, stats):
                    SET last_seen = %s,
                        transfer_rx = %s,
                        transfer_tx = %s,
-                       endpoint_client = %s,
-                       updated_at = NOW()
+                       endpoint_client = %s
                  WHERE code = %s;
             """, (s["last_seen"], s["rx"], s["tx"], s.get("endpoint_client"), matched_code))
             
