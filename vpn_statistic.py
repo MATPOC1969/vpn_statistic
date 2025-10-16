@@ -330,7 +330,7 @@ def get_wg_dump(host: str, interface: str, port: int = 22) -> list[str]:
 
 
 def parse_wg_output(output, interface: str):
-    """Парсит вывод wg show dump и возвращает статистику по code (публичным ключам)"""
+    """Парсит вывод wg show dump и возвращает статистику по публичным ключам и allowed_ips"""
     stats = {}
     for i, line in enumerate(output):
         parts = line.split("\t")
@@ -347,13 +347,21 @@ def parse_wg_output(output, interface: str):
         except Exception:
             rx = tx = 0
         
+        # Извлекаем IP адрес из allowed_ips (формат: "10.50.0.2/32")
+        ip_address = None
+        if allowed_ips and allowed_ips != "(none)":
+            # Берём первый IP, убираем маску
+            first_ip = allowed_ips.split(",")[0].strip()
+            ip_address = first_ip.split("/")[0] if "/" in first_ip else first_ip
+        
         # Используем публичный ключ как идентификатор
         stats[public_key] = {
             "last_seen": last_seen,
             "rx": rx,
             "tx": tx,
             "interface": interface,
-            "endpoint_client": endpoint_client if endpoint_client != "(none)" else None
+            "endpoint_client": endpoint_client if endpoint_client != "(none)" else None,
+            "ip_address": ip_address
         }
     return stats
 
@@ -396,6 +404,21 @@ def collect_stats():
     return all_stats
 
 
+def derive_public_key(private_key: str) -> str:
+    """Вычисляет публичный ключ из приватного с помощью wg pubkey"""
+    try:
+        result = subprocess.run(
+            ["wg", "pubkey"],
+            input=private_key.encode(),
+            capture_output=True,
+            check=True
+        )
+        return result.stdout.decode().strip()
+    except Exception as e:
+        log(f"⚠️  Ошибка вычисления публичного ключа: {e}")
+        return None
+
+
 def sync_clients(conn):
     """Синхронизирует VPN-клиенты со всех серверов и интерфейсов"""
     cur = conn.cursor()
@@ -403,6 +426,27 @@ def sync_clients(conn):
     # Получаем существующие коды для проверки дубликатов
     cur.execute("SELECT code FROM vpnusers;")
     existing_codes = {row["code"] for row in cur.fetchall()}
+    
+    # Обновляем публичные ключи клиентов для существующих записей
+    cur.execute("SELECT code, private_key FROM vpnusers WHERE public_key_client IS NULL AND private_key IS NOT NULL;")
+    clients_without_client_key = cur.fetchall()
+    
+    if clients_without_client_key:
+        log(f"🔧 Обновление публичных ключей клиентов для {len(clients_without_client_key)} существующих записей...")
+        for client in clients_without_client_key:
+            try:
+                # Расшифровываем приватный ключ
+                private_key = fernet.decrypt(client["private_key"].encode()).decode()
+                # Вычисляем публичный ключ клиента
+                public_key_client = derive_public_key(private_key)
+                if public_key_client:
+                    # Шифруем и сохраняем публичный ключ клиента
+                    enc_public_client = fernet.encrypt(public_key_client.encode()).decode()
+                    cur.execute("UPDATE vpnusers SET public_key_client = %s WHERE code = %s;", (enc_public_client, client["code"]))
+                    log(f"    🔑 Обновлен public_key_client для {client['code']}")
+            except Exception as e:
+                log(f"    ⚠️  Ошибка обновления ключа для {client['code']}: {e}")
+        conn.commit()
     
     added = 0
     total = 0
@@ -451,9 +495,24 @@ def sync_clients(conn):
                     log(f"    ⚠️  Не удалось разобрать конфиг для {code}")
                     continue
                 
-                # Шифруем ключи
+                # Обрабатываем ключи:
+                # 1. public_key - это ключ СЕРВЕРА (из [Peer] PublicKey) - для восстановления конфигов
+                # 2. public_key_client - ключ КЛИЕНТА (вычисляется из PrivateKey) - для сопоставления со статистикой
+                
+                public_key_server = data.get("publickey")  # Ключ сервера из конфига
+                public_key_client = None
+                
+                if data.get("privatekey"):
+                    public_key_client = derive_public_key(data["privatekey"])
+                    if public_key_client:
+                        log(f"    🔑 {code}: вычислен публичный ключ клиента: {public_key_client[:20]}...")
+                    else:
+                        log(f"    ⚠️  {code}: не удалось вычислить публичный ключ клиента")
+                
+                # Шифруем все ключи
                 enc_private = fernet.encrypt(data["privatekey"].encode()).decode() if data.get("privatekey") else None
-                enc_public = fernet.encrypt(data["publickey"].encode()).decode() if data.get("publickey") else None
+                enc_public_server = fernet.encrypt(public_key_server.encode()).decode() if public_key_server else None
+                enc_public_client = fernet.encrypt(public_key_client.encode()).decode() if public_key_client else None
                 enc_preshared = fernet.encrypt(data["presharedkey"].encode()).decode() if data.get("presharedkey") else None
                 
                 # Получаем остальные поля
@@ -473,15 +532,15 @@ def sync_clients(conn):
                 cur.execute("""
                     INSERT INTO vpnusers (
                         code, address,
-                        private_key, public_key, preshared_key,
+                        private_key, public_key, public_key_client, preshared_key,
                         allowed_ips, endpoint, dns, persistent_keepalive,
                         soft, provider1, interface, created_at
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (code) DO NOTHING;
                 """, (
                     code, address,
-                    enc_private, enc_public, enc_preshared,
+                    enc_private, enc_public_server, enc_public_client, enc_preshared,
                     allowed_ips, endpoint, dns, keepalive,
                     soft, provider, interface, file_created_at
                 ))
@@ -496,54 +555,74 @@ def sync_clients(conn):
     log(f"✅ Синхронизация завершена. Всего обработано: {total}, добавлено: {added}")
 
 def update_stats(conn, stats):
-    """Обновляет статистику VPN-клиентов"""
+    """Обновляет статистику VPN-клиентов используя сопоставление по IP + public_key_client"""
     cur = conn.cursor()
     updated = 0
     not_found = 0
     
-    # Получаем всех клиентов с их зашифрованными публичными ключами
-    cur.execute("SELECT code, public_key, interface, provider1 FROM vpnusers WHERE public_key IS NOT NULL;")
-    clients = cur.fetchall()
-    
-    # Создаем словарь расшифрованных ключей для быстрого поиска
-    decrypted_keys = {}
-    for client in clients:
-        try:
-            encrypted_key = client["public_key"]
-            if encrypted_key:
-                decrypted_key = fernet.decrypt(encrypted_key.encode()).decode()
-                # Ключ: (provider, interface, decrypted_public_key)
-                key = (client["provider1"], client["interface"], decrypted_key)
-                decrypted_keys[key] = client["code"]
-        except Exception as e:
-            log(f"⚠️  Ошибка расшифровки ключа для {client['code']}: {e}")
-            continue
-    
-    log(f"🔑 Расшифровано {len(decrypted_keys)} публичных ключей")
+    log(f"📊 Начинаем сопоставление статистики для {len(stats)} записей...")
     
     # Обновляем статистику
     for key, s in stats.items():
-        provider, interface, public_key = key
+        provider, interface, public_key_from_wg = key
+        ip_address = s.get("ip_address")
         
-        # Ищем клиента по ключу
-        lookup_key = (provider, interface, public_key)
-        if lookup_key in decrypted_keys:
-            code = decrypted_keys[lookup_key]
+        if not ip_address:
+            log(f"⚠️  Нет IP адреса для ключа {public_key_from_wg[:20]}... на {provider}/{interface}")
+            not_found += 1
+            continue
+        
+        # Ищем клиентов с таким IP на этом провайдере/интерфейсе
+        # Address может быть в формате "10.50.0.2/32" или "10.50.0.2"
+        cur.execute("""
+            SELECT code, public_key_client 
+            FROM vpnusers 
+            WHERE provider1 = %s 
+              AND interface = %s 
+              AND (address = %s OR address LIKE %s)
+              AND public_key_client IS NOT NULL;
+        """, (provider, interface, ip_address, f"{ip_address}/%"))
+        
+        candidates = cur.fetchall()
+        
+        if not candidates:
+            log(f"⚠️  Не найден клиент с IP {ip_address} на {provider}/{interface}")
+            not_found += 1
+            continue
+        
+        # Проверяем публичные ключи кандидатов
+        matched_code = None
+        for candidate in candidates:
+            try:
+                encrypted_key = candidate["public_key_client"]
+                decrypted_key = fernet.decrypt(encrypted_key.encode()).decode()
+                
+                if decrypted_key == public_key_from_wg:
+                    matched_code = candidate["code"]
+                    break
+            except Exception as e:
+                log(f"⚠️  Ошибка расшифровки ключа для {candidate['code']}: {e}")
+                continue
+        
+        if matched_code:
             # Обновляем статистику
             cur.execute("""
                 UPDATE vpnusers
                    SET last_seen = %s,
                        transfer_rx = %s,
                        transfer_tx = %s,
-                       endpoint_client = %s
+                       endpoint_client = %s,
+                       updated_at = NOW()
                  WHERE code = %s;
-            """, (s["last_seen"], s["rx"], s["tx"], s.get("endpoint_client"), code))
+            """, (s["last_seen"], s["rx"], s["tx"], s.get("endpoint_client"), matched_code))
+            
             if cur.rowcount > 0:
                 updated += 1
+                status = "🟢 активен" if s["last_seen"] else "🔴 неактивен"
+                log(f"✅ {matched_code} ({ip_address}) — {status}, RX: {s['rx']}, TX: {s['tx']}")
         else:
             not_found += 1
-            # Для отладки
-            log(f"⚠️  Не найден клиент для ключа: {public_key[:20]}... на {provider}/{interface}")
+            log(f"⚠️  Ключ не совпадает для IP {ip_address} на {provider}/{interface} (найдено кандидатов: {len(candidates)})")
     
     conn.commit()
     cur.close()
